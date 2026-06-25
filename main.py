@@ -14,6 +14,7 @@ import re
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -39,11 +40,17 @@ class Config:
         大语言模型的 API Key。
     api_base : str
         大语言模型的请求地址。
+    parallel_count : int
+        同时发起的 LLM 翻译请求数量，默认 3。
+    verbose : bool
+        CLI 是否输出单元级翻译日志，默认 False。不持久化到本地配置。
     """
 
     source_path: Path = Path()
     api_key: str = ""
     api_base: str = _DEFAULT_API_BASE
+    parallel_count: int = 3
+    verbose: bool = False
 
 
 CONFIG_PATH = Path.home() / ".config" / "translate-markdown" / "config.json"
@@ -59,6 +66,7 @@ def load_config() -> Config:
     return Config(
         api_key=data.get("api_key", ""),
         api_base=data.get("api_base", _DEFAULT_API_BASE),
+        parallel_count=data.get("parallel_count", 3),
     )
 
 
@@ -69,6 +77,7 @@ def save_config(config: Config) -> None:
     data = {
         "api_key": config.api_key,
         "api_base": config.api_base,
+        "parallel_count": config.parallel_count,
     }
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -99,9 +108,29 @@ def parse_args(argv: list[str] | None = None) -> Config:
         action="store_true",
         help="启动图形界面",
     )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=None,
+        help="并发翻译请求数量（覆盖本地配置，1~10）",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="输出每个翻译单元的原文与译文",
+    )
     args = parser.parse_args(argv)
 
-    # 加载本地配置（api_key、api_base）
+    if args.parallel is not None and not (
+        _MIN_PARALLEL_COUNT <= args.parallel <= _MAX_PARALLEL_COUNT
+    ):
+        print(
+            f"错误：--parallel 必须在 {_MIN_PARALLEL_COUNT}~{_MAX_PARALLEL_COUNT} 之间",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    # 加载本地配置（api_key、api_base、parallel_count）
     file_config = load_config()
 
     if args.gui:
@@ -120,6 +149,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         source_path=source_path,
         api_key=file_config.api_key,
         api_base=file_config.api_base,
+        parallel_count=args.parallel if args.parallel is not None else file_config.parallel_count,
+        verbose=args.verbose,
     )
 
 
@@ -155,6 +186,10 @@ class MockLLMClient:
 # 重试参数
 _MAX_RETRIES = 3
 _INITIAL_BACKOFF = 1.0  # 秒
+
+# 并发数量限制
+_MIN_PARALLEL_COUNT = 1
+_MAX_PARALLEL_COUNT = 10
 
 
 class LLMClient:
@@ -483,6 +518,30 @@ def compute_checkpoint_path(source_path: Path) -> Path:
     return source_path.parent / f".{source_path.stem}_zh.checkpoint.json"
 
 
+def _truncate_for_log(text: str, max_length: int) -> str:
+    """如 text 超过 max_length，则截断并在末尾附加总长度提示。"""
+    if len(text) <= max_length:
+        return text
+    return f"{text[:max_length]}...（共 {len(text)} 字符）"
+
+
+def _format_unit_log(
+    unit: TranslationUnit,
+    result: TranslationResult,
+    current: int | None = None,
+    total: int | None = None,
+    max_length: int = 300,
+) -> str:
+    """把一个翻译单元格式化为日志字符串。"""
+    original = _truncate_for_log(unit.original, max_length)
+    translated = _truncate_for_log(result.translated, max_length)
+    if current is not None and total is not None:
+        header = f"[单元 {current}/{total}]"
+    else:
+        header = f"[单元 {unit.unit_id}]"
+    return f"{header}\n原文：{original}\n译文：{translated}"
+
+
 def save_checkpoint(
     path: Path,
     source_hash: str,
@@ -537,11 +596,13 @@ def translate_document(
     llm,  # duck-typed: needs .translate(unit) -> TranslationResult
     on_progress: Callable[[int, int, int], None] | None = None,
     on_log: Callable[[str], None] | None = None,
+    on_unit_translated: Callable[[TranslationUnit, TranslationResult], None] | None = None,
+    parallel_count: int = 1,
 ) -> Path:
     """执行完整翻译流程，返回目标文档路径。
 
     主流程：读取源文档并计算 MD5 → 预处理 → 检查 checkpoint →
-    翻译循环（逐批调用 LLM，回填结果，更新 checkpoint）→
+    翻译循环（按 parallel_count 并发调用 LLM，回填结果，更新 checkpoint）→
     合并输出 → 写入目标文档 → 删除 checkpoint。
 
     Parameters
@@ -550,6 +611,10 @@ def translate_document(
         进度回调，签名为 (current, total, unit_id)，每完成一个 unit 调用一次。
     on_log : callable | None
         日志回调，签名为 (message)，用于输出运行状态信息。
+    on_unit_translated : callable | None
+        单元完成回调，签名为 (unit, result)，用于展示原文与译文。
+    parallel_count : int
+        并发翻译请求数量，默认 1（串行）。
     """
 
     def _log(msg: str) -> None:
@@ -589,37 +654,64 @@ def translate_document(
     if on_progress is not None:
         on_progress(done_count, total, -1)
 
+    parallel_count = max(_MIN_PARALLEL_COUNT, min(parallel_count, _MAX_PARALLEL_COUNT))
+
+    def _handle_result(result: TranslationResult, unit: TranslationUnit) -> None:
+        """把一个翻译结果回填到内存与 checkpoint，并触发进度回调。"""
+        nonlocal done_count
+        translated_map[result.unit_id] = result.translated
+        completed_ids.add(result.unit_id)
+        done_count = len(completed_ids)
+        if on_unit_translated is not None:
+            on_unit_translated(unit, result)
+        # 为 checkpoint 构造更新后的 blocks（回填新翻译）
+        updated_blocks: list[Block] = []
+        for b in blocks:
+            if b.unit_id is not None and b.unit_id in translated_map:
+                updated_blocks.append(
+                    Block(
+                        block_id=b.block_id,
+                        original=b.original,
+                        translated=translated_map[b.unit_id],
+                        unit_id=b.unit_id,
+                        ip_paths=b.ip_paths,
+                    )
+                )
+            else:
+                updated_blocks.append(b)
+        save_checkpoint(
+            ckpt_path,
+            source_hash,
+            updated_blocks,
+            sorted(completed_ids),
+        )
+        if on_progress is not None:
+            on_progress(done_count, total, result.unit_id)
+
     if pending_units:
         _log(f"共 {total} 个单元，待翻译 {len(pending_units)} 个")
-        for unit in pending_units:
-            _log(f"正在翻译单元 {unit.unit_id}（第 {done_count + 1}/{total}）…")
-            result = llm.translate(unit)
-            translated_map[result.unit_id] = result.translated
-            completed_ids.add(result.unit_id)
-            done_count = len(completed_ids)
-            # 为 checkpoint 构造更新后的 blocks（回填新翻译）
-            updated_blocks: list[Block] = []
-            for b in blocks:
-                if b.unit_id is not None and b.unit_id in translated_map:
-                    updated_blocks.append(
-                        Block(
-                            block_id=b.block_id,
-                            original=b.original,
-                            translated=translated_map[b.unit_id],
-                            unit_id=b.unit_id,
-                            ip_paths=b.ip_paths,
-                        )
-                    )
-                else:
-                    updated_blocks.append(b)
-            save_checkpoint(
-                ckpt_path,
-                source_hash,
-                updated_blocks,
-                sorted(completed_ids),
-            )
-            if on_progress is not None:
-                on_progress(done_count, total, unit.unit_id)
+        if parallel_count > 1:
+            _log(f"并发数量：{parallel_count}")
+
+        if parallel_count == 1:
+            for unit in pending_units:
+                _log(f"正在翻译单元 {unit.unit_id}（第 {done_count + 1}/{total}）…")
+                result = llm.translate(unit)
+                _handle_result(result, unit)
+        else:
+            with ThreadPoolExecutor(max_workers=parallel_count) as executor:
+                future_to_unit = {
+                    executor.submit(llm.translate, unit): unit
+                    for unit in pending_units
+                }
+                try:
+                    for future in as_completed(future_to_unit):
+                        result = future.result()
+                        _handle_result(result, future_to_unit[future])
+                except Exception:
+                    for f in future_to_unit:
+                        f.cancel()
+                    raise
     else:
         _log("所有单元已完成（来自进度缓存）")
 
@@ -654,7 +746,19 @@ def run_cli(config: Config) -> None:
         llm = LLMClient(api_key=config.api_key, api_base=config.api_base)
     else:
         llm = MockLLMClient()
-    target_path = translate_document(config.source_path, llm)
+
+    unit_log_handler = None
+    if config.verbose:
+        def _print_unit_log(unit: TranslationUnit, result: TranslationResult) -> None:
+            print(_format_unit_log(unit, result))
+        unit_log_handler = _print_unit_log
+
+    target_path = translate_document(
+        config.source_path,
+        llm,
+        on_unit_translated=unit_log_handler,
+        parallel_count=config.parallel_count,
+    )
     print(f"翻译完成：{target_path}")
 
 
@@ -675,6 +779,7 @@ def run_gui() -> None:
         QMainWindow,
         QProgressBar,
         QPushButton,
+        QSpinBox,
         QTextEdit,
         QVBoxLayout,
         QWidget,
@@ -689,23 +794,51 @@ def run_gui() -> None:
         error = pyqtSignal(str)  # 错误信息
 
         def __init__(
-            self, source_path: Path, api_key: str, api_base: str, parent=None
+            self,
+            source_path: Path,
+            api_key: str,
+            api_base: str,
+            parallel_count: int,
+            parent=None,
         ) -> None:
             super().__init__(parent)
             self._source_path = source_path
             self._api_key = api_key
             self._api_base = api_base
+            self._parallel_count = parallel_count
 
         def run(self) -> None:
             try:
                 llm = LLMClient(
                     api_key=self._api_key, api_base=self._api_base
                 )
+                total_units = 0
+
+                def _on_progress(current: int, total: int, unit_id: int) -> None:
+                    nonlocal total_units
+                    if unit_id == -1:
+                        total_units = total
+                    self.progress.emit(current, total, unit_id)
+
+                def _on_unit_translated(
+                    unit: TranslationUnit, result: TranslationResult
+                ) -> None:
+                    self.log.emit(
+                        _format_unit_log(
+                            unit,
+                            result,
+                            current=unit.unit_id + 1,
+                            total=total_units,
+                        )
+                    )
+
                 target = translate_document(
                     self._source_path,
                     llm,
-                    on_progress=lambda c, t, uid: self.progress.emit(c, t, uid),
+                    on_progress=_on_progress,
                     on_log=lambda msg: self.log.emit(msg),
+                    on_unit_translated=_on_unit_translated,
+                    parallel_count=self._parallel_count,
                 )
                 self.finished_ok.emit(str(target))
             except Exception as exc:
@@ -753,6 +886,16 @@ def run_gui() -> None:
     base_layout.addWidget(base_edit)
     layout.addLayout(base_layout)
 
+    # 并行数量输入行
+    parallel_layout = QHBoxLayout()
+    parallel_label = QLabel("并行数量：")
+    parallel_spin = QSpinBox()
+    parallel_spin.setRange(_MIN_PARALLEL_COUNT, _MAX_PARALLEL_COUNT)
+    parallel_spin.setValue(config.parallel_count)
+    parallel_layout.addWidget(parallel_label)
+    parallel_layout.addWidget(parallel_spin)
+    layout.addLayout(parallel_layout)
+
     # 保存配置按钮 + 开始翻译按钮
     btn_layout = QHBoxLayout()
     save_btn = QPushButton("保存配置")
@@ -786,6 +929,7 @@ def run_gui() -> None:
         new_config = Config(
             api_key=key_edit.text(),
             api_base=base_edit.text(),
+            parallel_count=parallel_spin.value(),
         )
         save_config(new_config)
 
@@ -814,6 +958,7 @@ def run_gui() -> None:
             source_path=source,
             api_key=api_key,
             api_base=base_edit.text().strip(),
+            parallel_count=parallel_spin.value(),
             parent=window,
         )
         _worker.progress.connect(_on_progress)
