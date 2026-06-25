@@ -1,4 +1,4 @@
-"""translate-markdown — 将英文 Markdown 翻译成中文的工具。
+"""translate-markdown — 将英文 Markdown 文档翻译成中文的工具。
 
 单文件脚本，按职责分为四个模块区域：
 1. 配置模块
@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,16 +20,63 @@ from pathlib import Path
 # 配置模块
 # ---------------------------------------------------------------------------
 
+# DeepSeek 默认请求地址
+_DEFAULT_API_BASE = "https://api.deepseek.com"
+
 
 @dataclass(frozen=True)
 class Config:
-    """运行时配置。"""
+    """运行时配置。
 
-    source_path: Path
+    Attributes
+    ----------
+    source_path : Path
+        源文档路径。
+    api_key : str
+        大语言模型的 API Key。
+    api_base : str
+        大语言模型的请求地址。
+    """
+
+    source_path: Path = Path()
+    api_key: str = ""
+    api_base: str = _DEFAULT_API_BASE
+
+
+def config_path() -> Path:
+    """返回本地配置文件路径：~/.config/translate-markdown/config.json。"""
+    return Path.home() / ".config" / "translate-markdown" / "config.json"
+
+
+def load_config() -> Config:
+    """从本地 JSON 文件读取配置，文件不存在时返回默认值。"""
+    path = config_path()
+    if not path.is_file():
+        return Config()
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return Config(
+        api_key=data.get("api_key", ""),
+        api_base=data.get("api_base", _DEFAULT_API_BASE),
+    )
+
+
+def save_config(config: Config) -> None:
+    """将配置写入本地 JSON 文件。"""
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "api_key": config.api_key,
+        "api_base": config.api_base,
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
     """解析 CLI 参数，返回 Config。
+
+    先解析命令行参数，再从本地配置文件加载 api_key 和 api_base，
+    CLI 参数中的 source_path 始终来自命令行。
 
     Parameters
     ----------
@@ -40,17 +88,38 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
     parser.add_argument(
         "source",
+        nargs="?",
         type=Path,
+        default=None,
         help="源文档路径",
     )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="启动图形界面",
+    )
     args = parser.parse_args(argv)
+
+    # 加载本地配置（api_key、api_base）
+    file_config = load_config()
+
+    if args.gui:
+        return file_config
+
+    if args.source is None:
+        print("错误：未指定源文档路径（GUI 模式请使用 --gui）", file=sys.stderr)
+        raise SystemExit(1)
 
     source_path: Path = args.source.resolve()
     if not source_path.is_file():
         print(f"错误：源文档不存在 — {source_path}", file=sys.stderr)
         raise SystemExit(1)
 
-    return Config(source_path=source_path)
+    return Config(
+        source_path=source_path,
+        api_key=file_config.api_key,
+        api_base=file_config.api_base,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +267,99 @@ def run_cli(argv: list[str] | None = None) -> None:
     print(f"翻译完成：{target_path}")
 
 
+# ---------------------------------------------------------------------------
+# 前端模块 — GUI
+# ---------------------------------------------------------------------------
+
+
+def run_gui() -> None:
+    """GUI 入口：PyQt6 主窗口骨架。"""
+    from PyQt6.QtWidgets import (
+        QApplication,
+        QFileDialog,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QPushButton,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    config = load_config()
+
+    app = QApplication(sys.argv)
+    window = QMainWindow()
+    window.setWindowTitle("translate-markdown")
+    window.setMinimumSize(500, 200)
+
+    central = QWidget()
+    window.setCentralWidget(central)
+    layout = QVBoxLayout(central)
+
+    # 文件选择行
+    file_layout = QHBoxLayout()
+    file_label = QLabel("源文档：")
+    file_path_edit = QLineEdit()
+    file_path_edit.setReadOnly(True)
+    file_btn = QPushButton("选择文件…")
+    file_layout.addWidget(file_label)
+    file_layout.addWidget(file_path_edit)
+    file_layout.addWidget(file_btn)
+    layout.addLayout(file_layout)
+
+    # API Key 输入行
+    key_layout = QHBoxLayout()
+    key_label = QLabel("API Key：")
+    key_edit = QLineEdit()
+    key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+    key_edit.setText(config.api_key)
+    key_layout.addWidget(key_label)
+    key_layout.addWidget(key_edit)
+    layout.addLayout(key_layout)
+
+    # 请求地址输入行
+    base_layout = QHBoxLayout()
+    base_label = QLabel("请求地址：")
+    base_edit = QLineEdit()
+    base_edit.setText(config.api_base)
+    base_layout.addWidget(base_label)
+    base_layout.addWidget(base_edit)
+    layout.addLayout(base_layout)
+
+    # 保存配置按钮
+    save_btn = QPushButton("保存配置")
+    layout.addWidget(save_btn)
+
+    # 信号连接
+    def on_select_file() -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            window, "选择源文档", "", "Markdown 文件 (*.md);;所有文件 (*)"
+        )
+        if path:
+            file_path_edit.setText(path)
+
+    def on_save_config() -> None:
+        new_config = Config(
+            api_key=key_edit.text(),
+            api_base=base_edit.text(),
+        )
+        save_config(new_config)
+
+    file_btn.clicked.connect(on_select_file)
+    save_btn.clicked.connect(on_save_config)
+
+    window.show()
+    app.exec()
+
+
 def main() -> None:
-    run_cli()
+    config = parse_args()
+    if config.source_path == Path():
+        # GUI 模式：parse_args 已处理 --gui
+        run_gui()
+    else:
+        run_cli(sys.argv[1:])
 
 
 if __name__ == "__main__":
