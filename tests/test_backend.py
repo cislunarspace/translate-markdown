@@ -225,3 +225,42 @@ def test_paragraph_with_inline_code_and_code_block():
     assert "`run()`" in output
     assert "x = 42" in output
     assert "{{IC_" not in output
+
+
+def test_display_math_is_single_protected_block():
+    """$$...$$ 包裹的行间公式作为整体保护块，不拆分、不生成翻译单元。"""
+    source = textwrap.dedent("""\
+        Some text.
+
+        $$
+        a + b = c
+        d + e = f
+        $$
+
+        More text.
+    """)
+
+    blocks, units, ic_map = preprocess(source)
+
+    # 定位公式块（保护块，unit_id 为 None）
+    math_blocks = [b for b in blocks if b.unit_id is None and "$$" in b.original]
+    assert len(math_blocks) == 1
+
+    math_block = math_blocks[0]
+    assert "a + b = c" in math_block.original
+    assert "d + e = f" in math_block.original
+
+    # 公式内部不生成 TranslationUnit
+    math_unit_ids = {u.unit_id for u in units if "a + b" in u.original or "d + e" in u.original}
+    assert math_unit_ids == set()
+
+    # 合并输出保持公式原样
+    results = [
+        TranslationResult(unit_id=u.unit_id, translated=f"[translated] {u.original}")
+        for u in units
+    ]
+    output = merge_results(blocks, results, ic_map)
+
+    assert "a + b = c" in output
+    assert "d + e = f" in output
+    assert output.count("$$") == 2

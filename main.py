@@ -348,8 +348,9 @@ def _protect_image_paths(text: str) -> tuple[str, list[str]]:
 def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], dict[int, list[str]]]:
     """将源文档文本按物理行拆分为 Block 和 TranslationUnit。
 
-    使用状态机按"代码块 → 表格 → 行内元素"的顺序识别：
+    使用状态机按"代码块 → 行间公式 → 表格 → 行内元素"的顺序识别：
     - fenced code block（``` 或 ~~~ 开头）整体作为保护块
+    - LaTeX 行间公式（被 $$ 包裹）整体作为保护块
     - 连续含 | 的行（Markdown 表格）整体作为一个 TranslationUnit
     - 行内代码替换为占位符 ``{{IC_N}}``
     - 图片路径替换为占位符 ``{{IP_N}}``（alt 文本可译）
@@ -373,6 +374,7 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
     # 状态机状态
     in_code_block = False
     in_table = False
+    in_display_math = False
     fence_marker: str | None = None  # 当前代码块的围栏标记（``` 或 ~~~）
 
     # fence 行正则：3 个以上 ` 或 ~ 开头，后面可跟 info string
@@ -386,6 +388,9 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
 
     # 收集中的表格行
     table_lines: list[str] = []
+
+    # 收集中的行间公式行
+    display_math_lines: list[str] = []
 
     def _flush_table() -> None:
         """将收集中的表格行合并为一个 TranslationUnit。"""
@@ -407,54 +412,23 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
         unit_id += 1
         table_lines.clear()
 
+    def _flush_display_math() -> None:
+        """将收集中的行间公式行合并为一个保护块。"""
+        nonlocal block_id
+        if not display_math_lines:
+            return
+        block = Block(
+            block_id=block_id,
+            original="\n".join(display_math_lines),
+        )
+        blocks.append(block)
+        block_id += 1
+        display_math_lines.clear()
+
     for line in lines:
         stripped = line.strip()
 
-        if not in_code_block:
-            m = fence_re.match(stripped)
-            # 只有仅含同种字符的 fence 才算开始（info string 允许）
-            if m and all(c == m.group(1)[0] for c in m.group(1)):
-                # 进入代码块：先结束已开始的表格
-                if in_table:
-                    _flush_table()
-                    in_table = False
-                # fence 行本身不作为独立 Block，与代码内容合并
-                fence_marker = m.group(1)[0]  # 取第一个字符（` 或 ~）
-                end_pattern = re.compile(rf"^{re.escape(fence_marker)}{{3,}}\s*$")
-                in_code_block = True
-                code_lines: list[str] = [line]
-                continue
-
-            # 表格识别：连续含 | 的行整体作为一个 TranslationUnit
-            if table_row_re.match(stripped) or table_sep_re.match(stripped):
-                if not in_table:
-                    in_table = True
-                table_lines.append(line)
-                continue
-
-            # 遇到非表格行，先结束已开始的表格
-            if in_table:
-                _flush_table()
-                in_table = False
-
-            # 普通行：图片路径保护 + 行内代码替换为占位符
-            protected, ip_paths = _protect_image_paths(line)
-            replaced, codes = _extract_inline_code(protected)
-            block = Block(
-                block_id=block_id,
-                original=line,
-                unit_id=unit_id,
-                ip_paths=ip_paths if ip_paths else None,
-            )
-            blocks.append(block)
-            block_id += 1
-
-            unit = TranslationUnit(unit_id=unit_id, original=replaced)
-            units.append(unit)
-            if codes:
-                ic_map[unit_id] = codes
-            unit_id += 1
-        else:
+        if in_code_block:
             code_lines.append(line)
             # 检测结束 fence：与开始 fence 同一字符，至少同等长度
             if end_pattern.match(stripped):
@@ -464,6 +438,68 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
                 block_id += 1
                 in_code_block = False
                 fence_marker = None
+            continue
+
+        if in_display_math:
+            display_math_lines.append(line)
+            if stripped == "$$":
+                _flush_display_math()
+                in_display_math = False
+            continue
+
+        m = fence_re.match(stripped)
+        # 只有仅含同种字符的 fence 才算开始（info string 允许）
+        if m and all(c == m.group(1)[0] for c in m.group(1)):
+            # 进入代码块：先结束已开始的表格
+            if in_table:
+                _flush_table()
+                in_table = False
+            # fence 行本身不作为独立 Block，与代码内容合并
+            fence_marker = m.group(1)[0]  # 取第一个字符（` 或 ~）
+            end_pattern = re.compile(rf"^{re.escape(fence_marker)}{{3,}}\s*$")
+            in_code_block = True
+            code_lines: list[str] = [line]
+            continue
+
+        # 行间公式：独立的 $$ 行开始/结束
+        if stripped == "$$":
+            # 结束已开始的表格
+            if in_table:
+                _flush_table()
+                in_table = False
+            in_display_math = True
+            display_math_lines.append(line)
+            continue
+
+        # 表格识别：连续含 | 的行整体作为一个 TranslationUnit
+        if table_row_re.match(stripped) or table_sep_re.match(stripped):
+            if not in_table:
+                in_table = True
+            table_lines.append(line)
+            continue
+
+        # 遇到非表格行，先结束已开始的表格
+        if in_table:
+            _flush_table()
+            in_table = False
+
+        # 普通行：图片路径保护 + 行内代码替换为占位符
+        protected, ip_paths = _protect_image_paths(line)
+        replaced, codes = _extract_inline_code(protected)
+        block = Block(
+            block_id=block_id,
+            original=line,
+            unit_id=unit_id,
+            ip_paths=ip_paths if ip_paths else None,
+        )
+        blocks.append(block)
+        block_id += 1
+
+        unit = TranslationUnit(unit_id=unit_id, original=replaced)
+        units.append(unit)
+        if codes:
+            ic_map[unit_id] = codes
+        unit_id += 1
 
     # 文档末尾处理
     if in_table:
@@ -472,6 +508,9 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
     if in_code_block:
         block = Block(block_id=block_id, original="\n".join(code_lines))
         blocks.append(block)
+    # 如果文档末尾有未关闭的公式块，按保护块处理
+    if in_display_math:
+        _flush_display_math()
 
     return blocks, units, ic_map
 
