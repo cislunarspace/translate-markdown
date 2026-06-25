@@ -483,6 +483,12 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
             _flush_table()
             in_table = False
 
+        # 空行或纯空白行不生成 TranslationUnit，仅保留为块
+        if stripped == "":
+            blocks.append(Block(block_id=block_id, original=line, unit_id=None))
+            block_id += 1
+            continue
+
         # 普通行：图片路径保护 + 行内代码替换为占位符
         protected, ip_paths = _protect_image_paths(line)
         replaced, codes = _extract_inline_code(protected)

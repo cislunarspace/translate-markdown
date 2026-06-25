@@ -48,7 +48,6 @@ def test_table_is_single_translation_unit():
     assert "| Alice | 30 |" in table_unit.original
 
     # 总共 3 个 TranslationUnit：Some text.、表格、More text.（空行不生成 unit）
-    # 实际上空行也会生成 unit，总共 5 个块都有 unit_id
     translatable_blocks = [b for b in blocks if b.unit_id is not None]
     assert len(translatable_blocks) == len(units)
 
