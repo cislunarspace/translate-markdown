@@ -174,12 +174,15 @@ class Block:
         翻译结果，保护块为 None 表示原样保留。
     unit_id : int | None
         对应的 TranslationUnit id，保护块为 None。
+    ip_paths : list[str] | None
+        该块中图片占位符 {{IP_N}} 对应的原始路径列表。
     """
 
     block_id: int
     original: str
     translated: str | None = None
     unit_id: int | None = None
+    ip_paths: list[str] | None = None
 
 
 def _extract_inline_code(text: str) -> tuple[str, list[str]]:
@@ -199,12 +202,34 @@ def _extract_inline_code(text: str) -> tuple[str, list[str]]:
     return replaced, codes
 
 
+def _protect_image_paths(text: str) -> tuple[str, list[str]]:
+    """将图片路径替换为占位符，返回替换后的文本和原始路径列表。
+
+    匹配 ![alt text](path) 格式，路径部分替换为占位符 ``{{IP_N}}``，
+    alt 文本保留在原位供翻译。
+
+    占位符格式：``{{IP_0}}``、``{{IP_1}}``……
+    """
+    pattern = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+    paths: list[str] = []
+
+    def _replace(m: re.Match[str]) -> str:
+        idx = len(paths)
+        paths.append(m.group(2))
+        return f"![{m.group(1)}]({{{{IP_{idx}}}}})"
+
+    replaced = pattern.sub(_replace, text)
+    return replaced, paths
+
+
 def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], dict[int, list[str]]]:
     """将源文档文本按物理行拆分为 Block 和 TranslationUnit。
 
-    使用状态机识别 fenced code block（``` 或 ~~~ 开头）。
-    代码块整体作为一个保护块（translated=None），不生成 TranslationUnit。
-    非代码块行中，行内代码替换为占位符后生成 TranslationUnit。
+    使用状态机按"代码块 → 表格 → 行内元素"的顺序识别：
+    - fenced code block（``` 或 ~~~ 开头）整体作为保护块
+    - 连续含 | 的行（Markdown 表格）整体作为一个 TranslationUnit
+    - 行内代码替换为占位符 ``{{IC_N}}``
+    - 图片路径替换为占位符 ``{{IP_N}}``（alt 文本可译）
 
     Returns
     -------
@@ -224,10 +249,40 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
 
     # 状态机状态
     in_code_block = False
+    in_table = False
     fence_marker: str | None = None  # 当前代码块的围栏标记（``` 或 ~~~）
 
     # fence 行正则：3 个以上 ` 或 ~ 开头，后面可跟 info string
     fence_re = re.compile(r"^([`~]{3,})(.*)$")
+
+    # 表格行判定：行中含 |，且不是纯空白
+    table_row_re = re.compile(r"^\s*\|.+\|\s*$")
+
+    # 表格分隔行判定：|---|---| 或 | --- | --- |
+    table_sep_re = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
+
+    # 收集中的表格行
+    table_lines: list[str] = []
+
+    def _flush_table() -> None:
+        """将收集中的表格行合并为一个 TranslationUnit。"""
+        nonlocal unit_id, block_id
+        if not table_lines:
+            return
+        # 将所有表格行拼接为多行文本，作为一个 TranslationUnit
+        table_text = "\n".join(table_lines)
+        # 表格整体做行内代码替换（表格中可能有行内代码）
+        replaced, codes = _extract_inline_code(table_text)
+        block = Block(block_id=block_id, original=table_text, unit_id=unit_id)
+        blocks.append(block)
+        block_id += 1
+
+        unit = TranslationUnit(unit_id=unit_id, original=replaced)
+        units.append(unit)
+        if codes:
+            ic_map[unit_id] = codes
+        unit_id += 1
+        table_lines.clear()
 
     for line in lines:
         stripped = line.strip()
@@ -236,22 +291,45 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
             m = fence_re.match(stripped)
             # 只有仅含同种字符的 fence 才算开始（info string 允许）
             if m and all(c == m.group(1)[0] for c in m.group(1)):
-                # 进入代码块：fence 行本身不作为独立 Block，与代码内容合并
+                # 进入代码块：先结束已开始的表格
+                if in_table:
+                    _flush_table()
+                    in_table = False
+                # fence 行本身不作为独立 Block，与代码内容合并
                 fence_marker = m.group(1)[0]  # 取第一个字符（` 或 ~）
                 in_code_block = True
                 code_lines: list[str] = [line]
-            else:
-                # 可译行：行内代码替换为占位符
-                replaced, codes = _extract_inline_code(line)
-                block = Block(block_id=block_id, original=line, unit_id=unit_id)
-                blocks.append(block)
-                block_id += 1
+                continue
 
-                unit = TranslationUnit(unit_id=unit_id, original=replaced)
-                units.append(unit)
-                if codes:
-                    ic_map[unit_id] = codes
-                unit_id += 1
+            # 表格识别：连续含 | 的行整体作为一个 TranslationUnit
+            if table_row_re.match(stripped) or table_sep_re.match(stripped):
+                if not in_table:
+                    in_table = True
+                table_lines.append(line)
+                continue
+
+            # 遇到非表格行，先结束已开始的表格
+            if in_table:
+                _flush_table()
+                in_table = False
+
+            # 普通行：图片路径保护 + 行内代码替换为占位符
+            protected, ip_paths = _protect_image_paths(line)
+            replaced, codes = _extract_inline_code(protected)
+            block = Block(
+                block_id=block_id,
+                original=line,
+                unit_id=unit_id,
+                ip_paths=ip_paths if ip_paths else None,
+            )
+            blocks.append(block)
+            block_id += 1
+
+            unit = TranslationUnit(unit_id=unit_id, original=replaced)
+            units.append(unit)
+            if codes:
+                ic_map[unit_id] = codes
+            unit_id += 1
         else:
             code_lines.append(line)
             # 检测结束 fence：与开始 fence 同一字符，至少同等长度
@@ -264,6 +342,9 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
                 in_code_block = False
                 fence_marker = None
 
+    # 文档末尾处理
+    if in_table:
+        _flush_table()
     # 如果文档末尾有未关闭的代码块，按保护块处理
     if in_code_block:
         block = Block(block_id=block_id, original="\n".join(code_lines))
@@ -280,25 +361,35 @@ def merge_results(
     """将翻译结果回填到块列表，合并为目标文档文本。
 
     对翻译结果中的行内代码占位符 ``{{IC_N}}``，回填为原始行内代码文本。
+    对翻译结果中的图片路径占位符 ``{{IP_N}}``，回填为原始图片路径。
     """
     if ic_map is None:
         ic_map = {}
 
     result_map = {r.unit_id: r.translated for r in results}
     ic_pattern = re.compile(r"\{\{IC_(\d+)\}\}")
+    ip_pattern = re.compile(r"\{\{IP_(\d+)\}\}")
     output_lines: list[str] = []
 
     for block in blocks:
         uid = block.unit_id
         translated = result_map.get(uid) if uid is not None else None
         if translated is not None:
+            # 回填图片路径占位符
+            if block.ip_paths:
+                paths = block.ip_paths
+                def _restore_ip(m: re.Match[str], _paths=paths) -> str:
+                    idx = int(m.group(1))
+                    return _paths[idx] if idx < len(_paths) else m.group(0)
+                translated = ip_pattern.sub(_restore_ip, translated)
+
             # 回填行内代码占位符
             codes = ic_map.get(uid, [])
-            def _restore(m: re.Match[str], _codes=codes) -> str:
+            def _restore_ic(m: re.Match[str], _codes=codes) -> str:
                 idx = int(m.group(1))
                 return f"`{_codes[idx]}`" if idx < len(_codes) else m.group(0)
 
-            restored = ic_pattern.sub(_restore, translated)
+            restored = ic_pattern.sub(_restore_ic, translated)
             output_lines.append(restored)
         else:
             # 保护块：多行时逐行输出
