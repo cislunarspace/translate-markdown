@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -168,59 +169,140 @@ class Block:
     block_id : int
         块的顺序编号。
     original : str
-        原始文本（单行）。
+        原始文本（单行或多行）。
     translated : str | None
         翻译结果，保护块为 None 表示原样保留。
+    unit_id : int | None
+        对应的 TranslationUnit id，保护块为 None。
     """
 
     block_id: int
     original: str
     translated: str | None = None
+    unit_id: int | None = None
 
 
-def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit]]:
+def _extract_inline_code(text: str) -> tuple[str, list[str]]:
+    """将行内代码替换为占位符，返回替换后的文本和原始代码列表。
+
+    占位符格式：``{{IC_0}}``、``{{IC_1}}``……
+    """
+    pattern = re.compile(r"`([^`]+?)`")
+    codes: list[str] = []
+
+    def _replace(m: re.Match[str]) -> str:
+        idx = len(codes)
+        codes.append(m.group(1))
+        return f"{{{{IC_{idx}}}}}"
+
+    replaced = pattern.sub(_replace, text)
+    return replaced, codes
+
+
+def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], dict[int, list[str]]]:
     """将源文档文本按物理行拆分为 Block 和 TranslationUnit。
 
-    切片 1 不识别保护块，所有行均视为可译块。
+    使用状态机识别 fenced code block（``` 或 ~~~ 开头）。
+    代码块整体作为一个保护块（translated=None），不生成 TranslationUnit。
+    非代码块行中，行内代码替换为占位符后生成 TranslationUnit。
 
     Returns
     -------
     blocks : list[Block]
-        所有块列表（待翻译，translated 字段为 None）。
+        所有块列表（保护块的 translated 字段为 None）。
     units : list[TranslationUnit]
-        对应的翻译单元列表。
+        可译块对应的翻译单元列表。
+    ic_map : dict[int, list[str]]
+        TranslationUnit unit_id 到行内代码原始文本列表的映射。
     """
     lines = source_text.split("\n")
     blocks: list[Block] = []
     units: list[TranslationUnit] = []
+    ic_map: dict[int, list[str]] = {}
     unit_id = 0
+    block_id = 0
 
-    for i, line in enumerate(lines):
-        block = Block(block_id=i, original=line)
+    # 状态机状态
+    in_code_block = False
+    fence_marker: str | None = None  # 当前代码块的围栏标记（``` 或 ~~~）
+
+    # fence 行正则：3 个以上 ` 或 ~ 开头，后面可跟 info string
+    fence_re = re.compile(r"^([`~]{3,})(.*)$")
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not in_code_block:
+            m = fence_re.match(stripped)
+            # 只有仅含同种字符的 fence 才算开始（info string 允许）
+            if m and all(c == m.group(1)[0] for c in m.group(1)):
+                # 进入代码块：fence 行本身不作为独立 Block，与代码内容合并
+                fence_marker = m.group(1)[0]  # 取第一个字符（` 或 ~）
+                in_code_block = True
+                code_lines: list[str] = [line]
+            else:
+                # 可译行：行内代码替换为占位符
+                replaced, codes = _extract_inline_code(line)
+                block = Block(block_id=block_id, original=line, unit_id=unit_id)
+                blocks.append(block)
+                block_id += 1
+
+                unit = TranslationUnit(unit_id=unit_id, original=replaced)
+                units.append(unit)
+                if codes:
+                    ic_map[unit_id] = codes
+                unit_id += 1
+        else:
+            code_lines.append(line)
+            # 检测结束 fence：与开始 fence 同一字符，至少同等长度
+            end_pattern = re.compile(rf"^{re.escape(fence_marker)}{{3,}}\s*$")
+            if end_pattern.match(stripped):
+                # 代码块结束：合并为一个保护块
+                block = Block(block_id=block_id, original="\n".join(code_lines))
+                blocks.append(block)
+                block_id += 1
+                in_code_block = False
+                fence_marker = None
+
+    # 如果文档末尾有未关闭的代码块，按保护块处理
+    if in_code_block:
+        block = Block(block_id=block_id, original="\n".join(code_lines))
         blocks.append(block)
 
-        # 空行也发送给 LLM，保持行数对齐
-        unit = TranslationUnit(unit_id=unit_id, original=line)
-        units.append(unit)
-        unit_id += 1
-
-    return blocks, units
+    return blocks, units, ic_map
 
 
 def merge_results(
     blocks: list[Block],
     results: list[TranslationResult],
+    ic_map: dict[int, list[str]] | None = None,
 ) -> str:
-    """将翻译结果回填到块列表，合并为目标文档文本。"""
+    """将翻译结果回填到块列表，合并为目标文档文本。
+
+    对翻译结果中的行内代码占位符 ``{{IC_N}}``，回填为原始行内代码文本。
+    """
+    if ic_map is None:
+        ic_map = {}
+
     result_map = {r.unit_id: r.translated for r in results}
+    ic_pattern = re.compile(r"\{\{IC_(\d+)\}\}")
     output_lines: list[str] = []
 
-    for i, block in enumerate(blocks):
-        translated = result_map.get(i)
+    for block in blocks:
+        uid = block.unit_id
+        translated = result_map.get(uid) if uid is not None else None
         if translated is not None:
-            output_lines.append(translated)
+            # 回填行内代码占位符
+            codes = ic_map.get(uid, [])
+            def _restore(m: re.Match[str], _codes=codes) -> str:
+                idx = int(m.group(1))
+                return f"`{_codes[idx]}`" if idx < len(_codes) else m.group(0)
+
+            restored = ic_pattern.sub(_restore, translated)
+            output_lines.append(restored)
         else:
-            output_lines.append(block.original)
+            # 保护块：多行时逐行输出
+            output_lines.extend(block.original.split("\n"))
 
     return "\n".join(output_lines)
 
@@ -239,13 +321,13 @@ def translate_document(source_path: Path, llm: MockLLMClient) -> Path:
     source_text = source_path.read_text(encoding="utf-8")
 
     # 2. 预处理
-    blocks, units = preprocess(source_text)
+    blocks, units, ic_map = preprocess(source_text)
 
     # 3. 调用 LLM
     results = llm.translate_batch(units)
 
     # 4. 合并输出
-    target_text = merge_results(blocks, results)
+    target_text = merge_results(blocks, results, ic_map)
 
     # 5. 写入目标文档
     target_path = compute_target_path(source_path)
