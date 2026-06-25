@@ -179,7 +179,9 @@ class MockLLMClient:
     """Mock LLM 客户端，用于切片 1 的端到端打通。"""
 
     def translate(self, unit: TranslationUnit) -> TranslationResult:
-        """将原文加上固定前缀返回。"""
+        """将原文加上固定前缀返回；空内容保持原样。"""
+        if not unit.original.strip():
+            return TranslationResult(unit_id=unit.unit_id, translated=unit.original)
         return TranslationResult(unit_id=unit.unit_id, translated=f"[translated] {unit.original}")
 
 
@@ -225,12 +227,21 @@ class LLMClient:
             "model": "deepseek-chat",
             "messages": [
                 {
-                    "role": "user",
+                    "role": "system",
                     "content": (
-                        "Translate the following to Chinese, keep formatting:\n"
-                        f"{unit.original}"
+                        "You are a professional translator translating a Markdown document from English to Chinese. "
+                        "Translate the content inside the <source> tags into Chinese. "
+                        "You must follow these rules:\n"
+                        "1. Output ONLY the translation. Do not add explanations, preambles, formatting notes, or meta-commentary.\n"
+                        "2. Preserve Markdown formatting, including headings, lists, code blocks, math formulas, and placeholders.\n"
+                        "3. Keep URLs, code, math formulas, email addresses, version numbers, and proper nouns unchanged.\n"
+                        "4. Do not echo the user's request, ask for clarification, or include the <source> tags in your output."
                     ),
-                }
+                },
+                {
+                    "role": "user",
+                    "content": f"<source>\n{unit.original}\n</source>",
+                },
             ],
         }
 
@@ -261,7 +272,9 @@ class LLMClient:
         ) from last_exc
 
     def translate(self, unit: TranslationUnit) -> TranslationResult:
-        """翻译单个单元。"""
+        """翻译单个单元。空内容直接返回原文，避免无意义的 API 调用。"""
+        if not unit.original.strip():
+            return TranslationResult(unit_id=unit.unit_id, translated=unit.original)
         return self._translate_single(unit)
 
 
