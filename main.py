@@ -15,9 +15,10 @@ import json
 import re
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 
 # ---------------------------------------------------------------------------
@@ -552,18 +553,37 @@ def compute_target_path(source_path: Path) -> Path:
     return source_path.parent / f"{source_path.stem}_zh.md"
 
 
-def translate_document(source_path: Path, llm: Translator) -> Path:
+def translate_document(
+    source_path: Path,
+    llm: Translator,
+    on_progress: Callable[[int, int, int], None] | None = None,
+    on_log: Callable[[str], None] | None = None,
+) -> Path:
     """执行完整翻译流程，返回目标文档路径。
 
     主流程：读取源文档并计算 MD5 → 预处理 → 检查 checkpoint →
     翻译循环（逐批调用 LLM，回填结果，更新 checkpoint）→
     合并输出 → 写入目标文档 → 删除 checkpoint。
+
+    Parameters
+    ----------
+    on_progress : callable | None
+        进度回调，签名为 (current, total, unit_id)，每完成一个 unit 调用一次。
+    on_log : callable | None
+        日志回调，签名为 (message)，用于输出运行状态信息。
     """
+
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            on_log(msg)
+
     # 1. 读取源文档并计算 hash
+    _log("正在读取源文档…")
     source_text = source_path.read_text(encoding="utf-8")
     source_hash = compute_source_hash(source_text)
 
     # 2. 预处理
+    _log("正在预处理…")
     blocks, units, ic_map = preprocess(source_text)
 
     # 3. 检查 checkpoint
@@ -580,15 +600,25 @@ def translate_document(source_path: Path, llm: Translator) -> Path:
         for b in saved_blocks:
             if b.unit_id is not None and b.translated is not None:
                 translated_map[b.unit_id] = b.translated
+        _log(f"已从进度缓存恢复 {len(completed_ids)} 个单元")
 
     # 4. 翻译未完成的 units
     pending_units = [u for u in units if u.unit_id not in completed_ids]
+    total = len(units)
+    done_count = len(completed_ids)
+
+    if on_progress is not None:
+        on_progress(done_count, total, -1)
+
     if pending_units:
+        _log(f"共 {total} 个单元，待翻译 {len(pending_units)} 个")
         for unit in pending_units:
+            _log(f"正在翻译单元 {unit.unit_id}（第 {done_count + 1}/{total}）…")
             results = llm.translate_batch([unit])
             for r in results:
                 translated_map[r.unit_id] = r.translated
                 completed_ids.add(r.unit_id)
+            done_count = len(completed_ids)
             # 为 checkpoint 构造更新后的 blocks（回填新翻译）
             updated_blocks: list[Block] = []
             for b in blocks:
@@ -610,8 +640,13 @@ def translate_document(source_path: Path, llm: Translator) -> Path:
                 updated_blocks,
                 sorted(completed_ids),
             )
+            if on_progress is not None:
+                on_progress(done_count, total, unit.unit_id)
+    else:
+        _log("所有单元已完成（来自进度缓存）")
 
     # 5. 合并输出
+    _log("正在合并输出…")
     all_results = [
         TranslationResult(unit_id=uid, translated=txt)
         for uid, txt in translated_map.items()
@@ -626,6 +661,7 @@ def translate_document(source_path: Path, llm: Translator) -> Path:
     if ckpt_path.is_file():
         ckpt_path.unlink()
 
+    _log(f"翻译完成：{target_path}")
     return target_path
 
 
@@ -648,7 +684,8 @@ def run_cli(argv: list[str] | None = None) -> None:
 
 
 def run_gui() -> None:
-    """GUI 入口：PyQt6 主窗口骨架。"""
+    """GUI 入口：PyQt6 主窗口，含实时进度与错误展示。"""
+    from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot
     from PyQt6.QtWidgets import (
         QApplication,
         QFileDialog,
@@ -656,17 +693,51 @@ def run_gui() -> None:
         QLabel,
         QLineEdit,
         QMainWindow,
+        QProgressBar,
         QPushButton,
+        QTextEdit,
         QVBoxLayout,
         QWidget,
     )
+
+    class _TranslateWorker(QThread):
+        """后台翻译线程，通过信号将进度和日志传递到主线程。"""
+
+        progress = pyqtSignal(int, int, int)  # (current, total, unit_id)
+        log = pyqtSignal(str)
+        finished_ok = pyqtSignal(str)  # 目标文档路径
+        error = pyqtSignal(str)  # 错误信息
+
+        def __init__(
+            self, source_path: Path, api_key: str, api_base: str, parent=None
+        ) -> None:
+            super().__init__(parent)
+            self._source_path = source_path
+            self._api_key = api_key
+            self._api_base = api_base
+
+        def run(self) -> None:
+            try:
+                llm = LLMClient(
+                    api_key=self._api_key, api_base=self._api_base
+                )
+                target = translate_document(
+                    self._source_path,
+                    llm,
+                    on_progress=lambda c, t, uid: self.progress.emit(c, t, uid),
+                    on_log=lambda msg: self.log.emit(msg),
+                )
+                self.finished_ok.emit(str(target))
+            except Exception as exc:
+                tb = traceback.format_exc()
+                self.error.emit(f"{exc}\n{tb}")
 
     config = load_config()
 
     app = QApplication(sys.argv)
     window = QMainWindow()
     window.setWindowTitle("translate-markdown")
-    window.setMinimumSize(500, 200)
+    window.setMinimumSize(600, 400)
 
     central = QWidget()
     window.setCentralWidget(central)
@@ -702,11 +773,28 @@ def run_gui() -> None:
     base_layout.addWidget(base_edit)
     layout.addLayout(base_layout)
 
-    # 保存配置按钮
+    # 保存配置按钮 + 开始翻译按钮
+    btn_layout = QHBoxLayout()
     save_btn = QPushButton("保存配置")
-    layout.addWidget(save_btn)
+    start_btn = QPushButton("开始翻译")
+    btn_layout.addWidget(save_btn)
+    btn_layout.addWidget(start_btn)
+    layout.addLayout(btn_layout)
+
+    # 进度条
+    progress_bar = QProgressBar()
+    progress_bar.setValue(0)
+    progress_bar.setFormat("%v / %m")
+    layout.addWidget(progress_bar)
+
+    # 日志文本框
+    log_text = QTextEdit()
+    log_text.setReadOnly(True)
+    layout.addWidget(log_text)
 
     # 信号连接
+    _worker: _TranslateWorker | None = None  # 防止 GC 回收
+
     def on_select_file() -> None:
         path, _ = QFileDialog.getOpenFileName(
             window, "选择源文档", "", "Markdown 文件 (*.md);;所有文件 (*)"
@@ -721,8 +809,61 @@ def run_gui() -> None:
         )
         save_config(new_config)
 
+    def on_start_translate() -> None:
+        nonlocal _worker
+        # 校验输入
+        source_text = file_path_edit.text().strip()
+        if not source_text:
+            log_text.append("错误：请选择源文档。")
+            return
+        source = Path(source_text)
+        if not source.is_file():
+            log_text.append(f"错误：源文档不存在 — {source}")
+            return
+        api_key = key_edit.text().strip()
+        if not api_key:
+            log_text.append("错误：请填写 API Key。")
+            return
+
+        # 禁用按钮，重置 UI
+        start_btn.setEnabled(False)
+        log_text.clear()
+        progress_bar.setValue(0)
+
+        _worker = _TranslateWorker(
+            source_path=source,
+            api_key=api_key,
+            api_base=base_edit.text().strip(),
+            parent=window,
+        )
+        _worker.progress.connect(_on_progress)
+        _worker.log.connect(_on_log)
+        _worker.finished_ok.connect(_on_finished)
+        _worker.error.connect(_on_error)
+        _worker.start()
+
+    @pyqtSlot(int, int, int)
+    def _on_progress(current: int, total: int, unit_id: int) -> None:
+        progress_bar.setMaximum(total)
+        progress_bar.setValue(current)
+
+    @pyqtSlot(str)
+    def _on_log(message: str) -> None:
+        log_text.append(message)
+
+    @pyqtSlot(str)
+    def _on_finished(target_path: str) -> None:
+        start_btn.setEnabled(True)
+        log_text.append(f"目标文档已生成：{target_path}")
+
+    @pyqtSlot(str)
+    def _on_error(error_msg: str) -> None:
+        start_btn.setEnabled(True)
+        log_text.append(f"翻译出错：{error_msg}")
+
     file_btn.clicked.connect(on_select_file)
     save_btn.clicked.connect(on_save_config)
+    start_btn.clicked.connect(on_start_translate)
 
     window.show()
     app.exec()
