@@ -12,3 +12,17 @@
 - **废话应当尽量除去**。
 - **通俗、亲切，由小讲到大，由近讲到远，引人入胜**：先讲读者已知／当前的事物，再推到陌生／抽象的；忌一上来就宏大叙事或先搬死人、外国人。
 - **与读者完全平等**：靠分析说服，不要装腔作势来吓人；老老实实办事。
+
+## Agent skills
+
+### Issue tracker
+
+以 GitHub issue 管理 Issues 与 PRD，使用 `gh` CLI；外部 PR 不作为 triage 来源。详见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+使用默认五状态标签：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。详见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+Single-context 布局：仓库根目录一个 `CONTEXT.md`，架构决策记录在 `docs/adr/`。详见 `docs/agents/domain.md`。
