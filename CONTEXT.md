@@ -25,6 +25,7 @@
   - 代码块（fenced code blocks）
   - 行内代码
   - 图片的文件路径
+  - LaTeX 行间公式（被 `$$...$$` 包裹）
 
 - **整体可译块（Whole Translatable Block）**
   作为整体发送给 LLM 翻译的 Markdown 元素。单元格内的普通文本可译，但表格语法（管道符、分隔行）本身不能错位。当前仅 Markdown 表格属于此类。
