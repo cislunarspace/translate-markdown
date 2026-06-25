@@ -22,7 +22,7 @@ def test_save_and_load_roundtrip(tmp_path):
 
     original = Config(api_key="sk-test-123", api_base="https://custom.api.com")
 
-    with patch("main.config_path", return_value=config_file):
+    with patch("main.CONFIG_PATH", config_file):
         save_config(original)
         loaded = load_config()
 
@@ -34,7 +34,7 @@ def test_load_config_file_not_exist(tmp_path):
     """配置文件不存在时，load_config 应返回默认值。"""
     config_file = tmp_path / "nonexistent" / "config.json"
 
-    with patch("main.config_path", return_value=config_file):
+    with patch("main.CONFIG_PATH", config_file):
         config = load_config()
 
     assert config.api_key == ""
@@ -45,7 +45,7 @@ def test_save_config_creates_parent_dirs(tmp_path):
     """save_config 应自动创建父目录。"""
     config_file = tmp_path / "deep" / "nested" / "config.json"
 
-    with patch("main.config_path", return_value=config_file):
+    with patch("main.CONFIG_PATH", config_file):
         save_config(Config(api_key="key", api_base="https://example.com"))
 
     assert config_file.is_file()
@@ -58,7 +58,7 @@ def test_save_config_omits_source_path(tmp_path):
     """配置文件不应包含 source_path 字段。"""
     config_file = tmp_path / "config.json"
 
-    with patch("main.config_path", return_value=config_file):
+    with patch("main.CONFIG_PATH", config_file):
         save_config(Config(api_key="k", api_base="https://a.com"))
 
     data = json.loads(config_file.read_text(encoding="utf-8"))

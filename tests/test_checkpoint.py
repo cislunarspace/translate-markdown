@@ -7,6 +7,7 @@ import pytest
 
 from main import (
     Block,
+    TranslationResult,
     TranslationUnit,
     compute_checkpoint_path,
     compute_source_hash,
@@ -114,20 +115,14 @@ def test_load_checkpoint_returns_none_when_hash_mismatch(tmp_path):
 
 
 class _RecordingLLM:
-    """记录每次 translate_batch 接收的 units，用 Mock 行为返回。"""
+    """记录每次 translate 接收的 unit，用 Mock 行为返回。"""
 
     def __init__(self):
-        self.received: list[list[TranslationUnit]] = []
+        self.received: list[TranslationUnit] = []
 
-    def translate_batch(self, units):
-        self.received.append(list(units))
-        return [
-            TranslationResult(unit_id=u.unit_id, translated=f"[zh] {u.original}")
-            for u in units
-        ]
-
-
-from main import TranslationResult
+    def translate(self, unit):
+        self.received.append(unit)
+        return TranslationResult(unit_id=unit.unit_id, translated=f"[zh] {unit.original}")
 
 
 def test_translate_document_no_checkpoint(tmp_path):
@@ -153,19 +148,16 @@ def test_translate_document_no_checkpoint(tmp_path):
 
 
 class _PartialLLM:
-    """第一次调用翻译第一个 unit，第二次调用翻译全部。用于模拟中断。"""
+    """第一次调用翻译第一个 unit，之后正常翻译。用于模拟中断。"""
 
     def __init__(self):
         self.call_count = 0
-        self.received: list[list[TranslationUnit]] = []
+        self.received: list[TranslationUnit] = []
 
-    def translate_batch(self, units):
+    def translate(self, unit):
         self.call_count += 1
-        self.received.append(list(units))
-        return [
-            TranslationResult(unit_id=u.unit_id, translated=f"[zh] {u.original}")
-            for u in units
-        ]
+        self.received.append(unit)
+        return TranslationResult(unit_id=unit.unit_id, translated=f"[zh] {unit.original}")
 
 
 def test_checkpoint_interrupted_then_resume(tmp_path):
@@ -213,7 +205,7 @@ def test_checkpoint_interrupted_then_resume(tmp_path):
     assert "[zh] This is a paragraph." in content
     assert "[zh] Another paragraph." in content
     # LLM 只收到了未完成的 units（第一个 unit 已在 checkpoint 中，不应重复调用）
-    all_received_ids = [u.unit_id for batch in llm.received for u in batch]
+    all_received_ids = [u.unit_id for u in llm.received]
     assert units[0].unit_id not in all_received_ids
     # checkpoint 已删除
     assert not ckpt_path.exists()
@@ -305,6 +297,5 @@ def test_translate_document_calls_llm_per_unit(tmp_path):
 
     # 每个 unit 各调用一次
     assert len(llm.received) == len(units)
-    for i, batch in enumerate(llm.received):
-        assert len(batch) == 1
-        assert batch[0].unit_id == units[i].unit_id
+    for i, u in enumerate(llm.received):
+        assert u.unit_id == units[i].unit_id

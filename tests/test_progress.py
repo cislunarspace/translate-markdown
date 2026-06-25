@@ -83,7 +83,7 @@ def test_callbacks_are_optional(tmp_path):
 class _FailingLLMClient:
     """翻译时抛出异常的 Mock 客户端，用于测试错误处理。"""
 
-    def translate_batch(self, units):
+    def translate(self, unit):
         raise RuntimeError("模拟网络错误")
 
 

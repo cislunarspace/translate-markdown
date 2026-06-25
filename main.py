@@ -7,8 +7,6 @@
 4. 前端模块（CLI / GUI）
 """
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import json
@@ -18,7 +16,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable
 
 
 # ---------------------------------------------------------------------------
@@ -48,14 +46,12 @@ class Config:
     api_base: str = _DEFAULT_API_BASE
 
 
-def config_path() -> Path:
-    """返回本地配置文件路径：~/.config/translate-markdown/config.json。"""
-    return Path.home() / ".config" / "translate-markdown" / "config.json"
+CONFIG_PATH = Path.home() / ".config" / "translate-markdown" / "config.json"
 
 
 def load_config() -> Config:
     """从本地 JSON 文件读取配置，文件不存在时返回默认值。"""
-    path = config_path()
+    path = CONFIG_PATH
     if not path.is_file():
         return Config()
 
@@ -68,7 +64,7 @@ def load_config() -> Config:
 
 def save_config(config: Config) -> None:
     """将配置写入本地 JSON 文件。"""
-    path = config_path()
+    path = CONFIG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "api_key": config.api_key,
@@ -148,21 +144,12 @@ class TranslationResult:
     translated: str
 
 
-class Translator(Protocol):
-    """LLM 客户端的统一接口。"""
-
-    def translate_batch(self, units: list[TranslationUnit]) -> list[TranslationResult]: ...
-
-
 class MockLLMClient:
     """Mock LLM 客户端，用于切片 1 的端到端打通。"""
 
-    def translate_batch(self, units: list[TranslationUnit]) -> list[TranslationResult]:
-        """将每行英文加上固定前缀返回。"""
-        return [
-            TranslationResult(unit_id=u.unit_id, translated=f"[translated] {u.original}")
-            for u in units
-        ]
+    def translate(self, unit: TranslationUnit) -> TranslationResult:
+        """将原文加上固定前缀返回。"""
+        return TranslationResult(unit_id=unit.unit_id, translated=f"[translated] {unit.original}")
 
 
 # 重试参数
@@ -238,13 +225,9 @@ class LLMClient:
             f"翻译单元 {unit.unit_id} 失败，已重试 {_MAX_RETRIES} 次"
         ) from last_exc
 
-    def translate_batch(self, units: list[TranslationUnit]) -> list[TranslationResult]:
-        """批量翻译；整体失败时降级为逐条请求。"""
-        try:
-            return [self._translate_single(u) for u in units]
-        except RuntimeError:
-            # 逐条重新发起，失败的单元会在 _translate_single 内重试并最终抛出
-            return [self._translate_single(u) for u in units]
+    def translate(self, unit: TranslationUnit) -> TranslationResult:
+        """翻译单个单元。"""
+        return self._translate_single(unit)
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +372,7 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
                     in_table = False
                 # fence 行本身不作为独立 Block，与代码内容合并
                 fence_marker = m.group(1)[0]  # 取第一个字符（` 或 ~）
+                end_pattern = re.compile(rf"^{re.escape(fence_marker)}{{3,}}\s*$")
                 in_code_block = True
                 code_lines: list[str] = [line]
                 continue
@@ -425,7 +409,6 @@ def preprocess(source_text: str) -> tuple[list[Block], list[TranslationUnit], di
         else:
             code_lines.append(line)
             # 检测结束 fence：与开始 fence 同一字符，至少同等长度
-            end_pattern = re.compile(rf"^{re.escape(fence_marker)}{{3,}}\s*$")
             if end_pattern.match(stripped):
                 # 代码块结束：合并为一个保护块
                 block = Block(block_id=block_id, original="\n".join(code_lines))
@@ -548,14 +531,10 @@ def load_checkpoint(path: Path, source_hash: str) -> tuple[list[Block], list[int
     return blocks, completed_ids
 
 
-def compute_target_path(source_path: Path) -> Path:
-    """计算目标文档路径：{stem}_zh.md，与源文档同目录。"""
-    return source_path.parent / f"{source_path.stem}_zh.md"
-
 
 def translate_document(
     source_path: Path,
-    llm: Translator,
+    llm,  # duck-typed: needs .translate(unit) -> TranslationResult
     on_progress: Callable[[int, int, int], None] | None = None,
     on_log: Callable[[str], None] | None = None,
 ) -> Path:
@@ -614,10 +593,9 @@ def translate_document(
         _log(f"共 {total} 个单元，待翻译 {len(pending_units)} 个")
         for unit in pending_units:
             _log(f"正在翻译单元 {unit.unit_id}（第 {done_count + 1}/{total}）…")
-            results = llm.translate_batch([unit])
-            for r in results:
-                translated_map[r.unit_id] = r.translated
-                completed_ids.add(r.unit_id)
+            result = llm.translate(unit)
+            translated_map[result.unit_id] = result.translated
+            completed_ids.add(result.unit_id)
             done_count = len(completed_ids)
             # 为 checkpoint 构造更新后的 blocks（回填新翻译）
             updated_blocks: list[Block] = []
@@ -654,7 +632,7 @@ def translate_document(
     target_text = merge_results(blocks, all_results, ic_map)
 
     # 6. 写入目标文档
-    target_path = compute_target_path(source_path)
+    target_path = source_path.parent / f"{source_path.stem}_zh.md"
     target_path.write_text(target_text, encoding="utf-8")
 
     # 7. 删除 checkpoint
@@ -670,10 +648,12 @@ def translate_document(
 # ---------------------------------------------------------------------------
 
 
-def run_cli(argv: list[str] | None = None) -> None:
+def run_cli(config: Config) -> None:
     """CLI 入口。"""
-    config = parse_args(argv)
-    llm = MockLLMClient()
+    if config.api_key:
+        llm = LLMClient(api_key=config.api_key, api_base=config.api_base)
+    else:
+        llm = MockLLMClient()
     target_path = translate_document(config.source_path, llm)
     print(f"翻译完成：{target_path}")
 
@@ -875,7 +855,7 @@ def main() -> None:
         # GUI 模式：parse_args 已处理 --gui
         run_gui()
     else:
-        run_cli(sys.argv[1:])
+        run_cli(config)
 
 
 if __name__ == "__main__":

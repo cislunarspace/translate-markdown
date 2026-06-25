@@ -32,7 +32,7 @@ def test_whitespace_api_key_raises_value_error():
 
 
 @patch("requests.post")
-def test_translate_batch_returns_translated_text(mock_post: MagicMock):
+def test_translate_returns_translated_text(mock_post: MagicMock):
     """配置有效时，调用 DeepSeek API 返回真实中文翻译。"""
     mock_resp = MagicMock()
     mock_resp.status_code = 200
@@ -43,48 +43,15 @@ def test_translate_batch_returns_translated_text(mock_post: MagicMock):
     mock_post.return_value = mock_resp
 
     client = LLMClient(api_key="test-key-123")
-    units = [TranslationUnit(unit_id=0, original="Hello world")]
-    results = client.translate_batch(units)
+    unit = TranslationUnit(unit_id=0, original="Hello world")
+    result = client.translate(unit)
 
-    assert len(results) == 1
-    assert results[0].unit_id == 0
-    assert results[0].translated == "你好世界"
+    assert result.unit_id == 0
+    assert result.translated == "你好世界"
 
     mock_post.assert_called_once()
     call_kwargs = mock_post.call_args
     assert call_kwargs.kwargs["headers"]["Authorization"] == "Bearer test-key-123"
-
-
-@patch("requests.post")
-def test_translate_batch_multiple_units(mock_post: MagicMock):
-    """批量翻译多个单元，每个单元分别调用 API。"""
-    mock_resp1 = MagicMock()
-    mock_resp1.status_code = 200
-    mock_resp1.raise_for_status = MagicMock()
-    mock_resp1.json.return_value = {
-        "choices": [{"message": {"content": "你好"}}]
-    }
-
-    mock_resp2 = MagicMock()
-    mock_resp2.status_code = 200
-    mock_resp2.raise_for_status = MagicMock()
-    mock_resp2.json.return_value = {
-        "choices": [{"message": {"content": "世界"}}]
-    }
-
-    mock_post.side_effect = [mock_resp1, mock_resp2]
-
-    client = LLMClient(api_key="test-key")
-    units = [
-        TranslationUnit(unit_id=0, original="Hello"),
-        TranslationUnit(unit_id=1, original="World"),
-    ]
-    results = client.translate_batch(units)
-
-    assert len(results) == 2
-    assert results[0].translated == "你好"
-    assert results[1].translated == "世界"
-    assert mock_post.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +73,10 @@ def test_retry_on_connection_error_then_success(mock_post: MagicMock, mock_sleep
     mock_post.side_effect = [requests.ConnectionError("连接失败"), success_resp]
 
     client = LLMClient(api_key="test-key")
-    units = [TranslationUnit(unit_id=0, original="test")]
-    results = client.translate_batch(units)
+    unit = TranslationUnit(unit_id=0, original="test")
+    result = client.translate(unit)
 
-    assert results[0].translated == "成功翻译"
+    assert result.translated == "成功翻译"
     assert mock_post.call_count == 2
     mock_sleep.assert_called_once_with(1.0)  # 首次退避 1 秒
 
@@ -128,10 +95,10 @@ def test_retry_on_timeout_then_success(mock_post: MagicMock, mock_sleep: MagicMo
     mock_post.side_effect = [requests.Timeout("超时"), success_resp]
 
     client = LLMClient(api_key="test-key")
-    units = [TranslationUnit(unit_id=0, original="test")]
-    results = client.translate_batch(units)
+    unit = TranslationUnit(unit_id=0, original="test")
+    result = client.translate(unit)
 
-    assert results[0].translated == "超时重试成功"
+    assert result.translated == "超时重试成功"
     assert mock_post.call_count == 2
 
 
@@ -142,15 +109,13 @@ def test_retry_exhausted_raises_runtime_error(mock_post: MagicMock, mock_sleep: 
     mock_post.side_effect = requests.ConnectionError("持续失败")
 
     client = LLMClient(api_key="test-key")
-    units = [TranslationUnit(unit_id=0, original="test")]
+    unit = TranslationUnit(unit_id=0, original="test")
 
     with pytest.raises(RuntimeError, match="翻译单元 0 失败"):
-        client.translate_batch(units)
+        client.translate(unit)
 
-    # translate_batch 降级：首轮 4 次 + 降级后 4 次 = 8 次
-    assert mock_post.call_count == 8
-    # 退避调用：每轮 3 次（1s, 2s, 4s），共 2 轮 = 6 次
-    assert mock_sleep.call_count == 6
+    assert mock_post.call_count == 4  # 1 次初始 + 3 次重试
+    assert mock_sleep.call_count == 3
     mock_sleep.assert_any_call(1.0)
     mock_sleep.assert_any_call(2.0)
     mock_sleep.assert_any_call(4.0)
@@ -182,9 +147,9 @@ def test_retry_on_429_rate_limit(mock_post: MagicMock, mock_sleep: MagicMock):
     mock_post.side_effect = [rate_limit_resp, success_resp]
 
     client = LLMClient(api_key="test-key")
-    units = [TranslationUnit(unit_id=0, original="test")]
-    results = client.translate_batch(units)
+    unit = TranslationUnit(unit_id=0, original="test")
+    result = client.translate(unit)
 
-    assert results[0].translated == "限流后成功"
+    assert result.translated == "限流后成功"
     assert mock_post.call_count == 2
     mock_sleep.assert_called_once_with(1.0)
