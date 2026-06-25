@@ -203,7 +203,7 @@ wheels = [
 
 [[package]]
 name = "translate-markdown"
-version = "1.0.1"
+version = "1.0.2"
 source = { virtual = "." }
 dependencies = [
     { name = "pyqt6" },
