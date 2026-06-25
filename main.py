@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -488,6 +489,64 @@ def merge_results(
     return "\n".join(output_lines)
 
 
+def compute_source_hash(source_text: str) -> str:
+    """计算源文档文本的 MD5 哈希。"""
+    return hashlib.md5(source_text.encode("utf-8")).hexdigest()
+
+
+def compute_checkpoint_path(source_path: Path) -> Path:
+    """返回 checkpoint 文件路径：与目标文档同目录，文件名 .{stem}_zh.checkpoint.json。"""
+    return source_path.parent / f".{source_path.stem}_zh.checkpoint.json"
+
+
+def save_checkpoint(
+    path: Path,
+    source_hash: str,
+    blocks: list[Block],
+    completed_ids: list[int],
+) -> None:
+    """保存 checkpoint JSON，包含 source_hash、已完成 unit_id 列表和完整块列表。"""
+    data = {
+        "source_hash": source_hash,
+        "completed_units": sorted(completed_ids),
+        "blocks": [
+            {
+                "block_id": b.block_id,
+                "original": b.original,
+                "translated": b.translated,
+                "unit_id": b.unit_id,
+            }
+            for b in blocks
+        ],
+    }
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_checkpoint(path: Path, source_hash: str) -> tuple[list[Block], list[int]] | None:
+    """加载 checkpoint；文件不存在或 source_hash 不匹配时返回 None。"""
+    if not path.is_file():
+        return None
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("source_hash") != source_hash:
+        return None
+
+    completed_ids: list[int] = data.get("completed_units", [])
+    blocks = [
+        Block(
+            block_id=b["block_id"],
+            original=b["original"],
+            translated=b.get("translated"),
+            unit_id=b.get("unit_id"),
+        )
+        for b in data.get("blocks", [])
+    ]
+    return blocks, completed_ids
+
+
 def compute_target_path(source_path: Path) -> Path:
     """计算目标文档路径：{stem}_zh.md，与源文档同目录。"""
     return source_path.parent / f"{source_path.stem}_zh.md"
@@ -496,23 +555,76 @@ def compute_target_path(source_path: Path) -> Path:
 def translate_document(source_path: Path, llm: Translator) -> Path:
     """执行完整翻译流程，返回目标文档路径。
 
-    主流程：读取源文档 → 预处理 → 调用 LLM → 合并输出 → 写入目标文档。
+    主流程：读取源文档并计算 MD5 → 预处理 → 检查 checkpoint →
+    翻译循环（逐批调用 LLM，回填结果，更新 checkpoint）→
+    合并输出 → 写入目标文档 → 删除 checkpoint。
     """
-    # 1. 读取源文档
+    # 1. 读取源文档并计算 hash
     source_text = source_path.read_text(encoding="utf-8")
+    source_hash = compute_source_hash(source_text)
 
     # 2. 预处理
     blocks, units, ic_map = preprocess(source_text)
 
-    # 3. 调用 LLM
-    results = llm.translate_batch(units)
+    # 3. 检查 checkpoint
+    ckpt_path = compute_checkpoint_path(source_path)
+    ckpt = load_checkpoint(ckpt_path, source_hash)
 
-    # 4. 合并输出
-    target_text = merge_results(blocks, results, ic_map)
+    completed_ids: set[int] = set()
+    translated_map: dict[int, str] = {}
 
-    # 5. 写入目标文档
+    if ckpt is not None:
+        saved_blocks, saved_completed = ckpt
+        completed_ids = set(saved_completed)
+        # 恢复已有翻译结果
+        for b in saved_blocks:
+            if b.unit_id is not None and b.translated is not None:
+                translated_map[b.unit_id] = b.translated
+
+    # 4. 翻译未完成的 units
+    pending_units = [u for u in units if u.unit_id not in completed_ids]
+    if pending_units:
+        for unit in pending_units:
+            results = llm.translate_batch([unit])
+            for r in results:
+                translated_map[r.unit_id] = r.translated
+                completed_ids.add(r.unit_id)
+            # 为 checkpoint 构造更新后的 blocks（回填新翻译）
+            updated_blocks: list[Block] = []
+            for b in blocks:
+                if b.unit_id is not None and b.unit_id in translated_map:
+                    updated_blocks.append(
+                        Block(
+                            block_id=b.block_id,
+                            original=b.original,
+                            translated=translated_map[b.unit_id],
+                            unit_id=b.unit_id,
+                            ip_paths=b.ip_paths,
+                        )
+                    )
+                else:
+                    updated_blocks.append(b)
+            save_checkpoint(
+                ckpt_path,
+                source_hash,
+                updated_blocks,
+                sorted(completed_ids),
+            )
+
+    # 5. 合并输出
+    all_results = [
+        TranslationResult(unit_id=uid, translated=txt)
+        for uid, txt in translated_map.items()
+    ]
+    target_text = merge_results(blocks, all_results, ic_map)
+
+    # 6. 写入目标文档
     target_path = compute_target_path(source_path)
     target_path.write_text(target_text, encoding="utf-8")
+
+    # 7. 删除 checkpoint
+    if ckpt_path.is_file():
+        ckpt_path.unlink()
 
     return target_path
 
