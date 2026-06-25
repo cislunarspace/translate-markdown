@@ -39,10 +39,9 @@ def test_fenced_code_block_is_protected():
     assert "x = 1 + 2" in code_block.original
     assert code_block.translated is None
 
-    # 只有普通段落和空行生成了 TranslationUnit（代码块不生成）
-    assert len(units) == 2
+    # 只有普通段落生成了 TranslationUnit（代码块和空行不生成）
+    assert len(units) == 1
     assert units[0].original == "Hello world."
-    assert units[1].original == ""
 
 
 def test_tilde_fence_is_also_protected():
@@ -81,12 +80,10 @@ def test_code_block_surrounding_text_is_translated():
     assert "```" in blocks[2].original
     assert blocks[4].original == "After text."
 
-    # 四个 TranslationUnit：两个段落 + 两个空行（代码块不生成 unit）
-    assert len(units) == 4
+    # 两个 TranslationUnit：Before text 和 After text（空行和代码块不生成 unit）
+    assert len(units) == 2
     assert units[0].original == "Before text."
-    assert units[1].original == ""
-    assert units[2].original == ""
-    assert units[3].original == "After text."
+    assert units[1].original == "After text."
 
 
 # ---------------------------------------------------------------------------
@@ -205,18 +202,19 @@ def test_paragraph_with_inline_code_and_code_block():
 
     # 五个块：段落、空行、代码块、空行、段落
     assert len(blocks) == 5
-    assert len(units) == 4  # 两个段落 + 两个空行
+    # 两个 TranslationUnit：两个段落（空行和代码块不生成 unit）
+    assert len(units) == 2
 
-    # 行内代码占位符在 units[0] 和 units[3]（跳过空行 unit）
+    # 行内代码占位符在两个段落 unit 中
     assert "{{IC_0}}" in units[0].original  # main.py
-    assert "{{IC_0}}" in units[3].original  # run()
+    assert "{{IC_0}}" in units[1].original  # run()
+    assert ic_map[0] == ["main.py"]
+    assert ic_map[1] == ["run()"]
 
     # 模拟 LLM 翻译
     results = [
         TranslationResult(unit_id=0, translated="运行 {{IC_0}} 来启动。"),
-        TranslationResult(unit_id=1, translated=""),
-        TranslationResult(unit_id=2, translated=""),
-        TranslationResult(unit_id=3, translated="然后调用 {{IC_0}} 来完成。"),
+        TranslationResult(unit_id=1, translated="然后调用 {{IC_0}} 来完成。"),
     ]
 
     output = merge_results(blocks, results, ic_map)

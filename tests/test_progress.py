@@ -35,14 +35,14 @@ def test_on_progress_called_for_each_unit(tmp_path):
         on_log=lambda msg: log_messages.append(msg),
     )
 
-    # "Line one.\nLine two.\nLine three.\n" → 4 个行：3 个非空 + 1 个尾部空行，共 4 个 TranslationUnit
-    # 进度回调：1 次初始化 + 4 次翻译完成 = 5 次
-    assert len(progress_calls) == 5
+    # "Line one.\nLine two.\nLine three.\n" → 3 个非空行，共 3 个 TranslationUnit
+    # 进度回调：1 次初始化 + 3 次翻译完成 = 4 次
+    assert len(progress_calls) == 4
 
-    # 最后一次：current == total == 4
+    # 最后一次：current == total == 3
     last = progress_calls[-1]
-    assert last[0] == 4  # current
-    assert last[1] == 4  # total
+    assert last[0] == 3  # current
+    assert last[1] == 3  # total
 
     # 日志回调被调用，包含关键状态信息
     assert len(log_messages) > 0
@@ -62,9 +62,9 @@ def test_on_progress_total_matches_unit_count(tmp_path):
         on_progress=lambda c, t, uid: progress_calls.append((c, t, uid)),
     )
 
-    # "First line.\nSecond line.\n" → 2 个非空行 + 1 个尾部空行，共 3 个 TranslationUnit
+    # "First line.\nSecond line.\n" → 2 个非空行，共 2 个 TranslationUnit
     totals = {t for _, t, _ in progress_calls}
-    assert totals == {3}
+    assert totals == {2}
 
 
 def test_callbacks_are_optional(tmp_path):
@@ -235,6 +235,32 @@ def test_on_unit_translated_callback_receives_unit_and_result(tmp_path):
     assert unit_id == 0
     assert original == "Hello world."
     assert translated == "[translated] Hello world."
+
+
+def test_blank_units_are_not_logged(tmp_path):
+    """空白行不应作为翻译单元输出到日志回调。"""
+    source = tmp_path / "blank_log.md"
+    source.write_text(
+        textwrap.dedent("""\
+            First paragraph.
+
+            Second paragraph.
+        """),
+        encoding="utf-8",
+    )
+
+    received: list[tuple[int, str, str]] = []
+
+    translate_document(
+        source,
+        MockLLMClient(),
+        on_unit_translated=lambda unit, result: received.append(
+            (unit.unit_id, unit.original, result.translated)
+        ),
+    )
+
+    blank_logs = [r for r in received if r[1].strip() == ""]
+    assert not blank_logs, f"发现空白单元日志：{blank_logs}"
 
 
 def test_format_unit_log_includes_original_and_translated():
