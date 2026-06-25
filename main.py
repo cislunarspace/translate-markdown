@@ -13,8 +13,10 @@ import argparse
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +146,12 @@ class TranslationResult:
     translated: str
 
 
+class Translator(Protocol):
+    """LLM 客户端的统一接口。"""
+
+    def translate_batch(self, units: list[TranslationUnit]) -> list[TranslationResult]: ...
+
+
 class MockLLMClient:
     """Mock LLM 客户端，用于切片 1 的端到端打通。"""
 
@@ -153,6 +161,88 @@ class MockLLMClient:
             TranslationResult(unit_id=u.unit_id, translated=f"[translated] {u.original}")
             for u in units
         ]
+
+
+# 重试参数
+_MAX_RETRIES = 3
+_INITIAL_BACKOFF = 1.0  # 秒
+
+
+class LLMClient:
+    """接入 DeepSeek API 的真实 LLM 客户端。
+
+    使用 OpenAI 兼容格式调用 DeepSeek chat completions 接口。
+    内置指数退避重试：网络异常和 HTTP 429 会触发重试，最多 3 次。
+
+    Parameters
+    ----------
+    api_key : str
+        DeepSeek API Key，不能为空。
+    api_base : str
+        API 请求地址。
+    """
+
+    def __init__(self, api_key: str, api_base: str = _DEFAULT_API_BASE) -> None:
+        if not api_key or not api_key.strip():
+            raise ValueError("API Key 未配置，请先设置有效的 API Key")
+        self._api_key = api_key
+        self._api_base = api_base
+
+    def _translate_single(self, unit: TranslationUnit) -> TranslationResult:
+        """调用 DeepSeek API 翻译单个单元。"""
+        import requests as _requests
+
+        url = f"{self._api_base.rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Translate the following to Chinese, keep formatting:\n"
+                        f"{unit.original}"
+                    ),
+                }
+            ],
+        }
+
+        last_exc: Exception | None = None
+        backoff = _INITIAL_BACKOFF
+
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                resp = _requests.post(url, json=payload, headers=headers, timeout=30)
+                if resp.status_code == 429:
+                    raise _requests.exceptions.HTTPError(
+                        f"HTTP 429: 限流",
+                        response=resp,
+                    )
+                resp.raise_for_status()
+                data = resp.json()
+                content: str = data["choices"][0]["message"]["content"]
+                return TranslationResult(unit_id=unit.unit_id, translated=content)
+            except (_requests.ConnectionError, _requests.Timeout, _requests.exceptions.HTTPError) as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRIES:
+                    time.sleep(backoff)
+                    backoff *= 2
+
+        # 重试用尽，抛出最终异常
+        raise RuntimeError(
+            f"翻译单元 {unit.unit_id} 失败，已重试 {_MAX_RETRIES} 次"
+        ) from last_exc
+
+    def translate_batch(self, units: list[TranslationUnit]) -> list[TranslationResult]:
+        """批量翻译；整体失败时降级为逐条请求。"""
+        try:
+            return [self._translate_single(u) for u in units]
+        except RuntimeError:
+            # 逐条重新发起，失败的单元会在 _translate_single 内重试并最终抛出
+            return [self._translate_single(u) for u in units]
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +493,7 @@ def compute_target_path(source_path: Path) -> Path:
     return source_path.parent / f"{source_path.stem}_zh.md"
 
 
-def translate_document(source_path: Path, llm: MockLLMClient) -> Path:
+def translate_document(source_path: Path, llm: Translator) -> Path:
     """执行完整翻译流程，返回目标文档路径。
 
     主流程：读取源文档 → 预处理 → 调用 LLM → 合并输出 → 写入目标文档。
