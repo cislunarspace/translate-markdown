@@ -54,6 +54,16 @@ def test_translate_returns_translated_text(mock_post: MagicMock):
     assert call_kwargs.kwargs["headers"]["Authorization"] == "Bearer test-key-123"
 
 
+def test_translate_empty_unit_skips_api_call():
+    """空或仅含空白的单元不调用 API，直接返回原文。"""
+    client = LLMClient(api_key="test-key")
+
+    for empty_original in ["", "   ", "\n\n"]:
+        unit = TranslationUnit(unit_id=0, original=empty_original)
+        result = client.translate(unit)
+        assert result.translated == empty_original
+
+
 # ---------------------------------------------------------------------------
 # 网络失败重试
 # ---------------------------------------------------------------------------
